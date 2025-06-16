@@ -12,6 +12,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	internal.CreateTables()
 	internal.BotToken = string(BotToken)
 	internal.Run()
 }
