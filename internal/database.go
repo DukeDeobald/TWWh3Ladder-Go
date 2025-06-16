@@ -2,10 +2,21 @@ package internal
 
 import (
 	"database/sql"
+	"fmt"
 	"log"
+	"os"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
+
+type MatchDB struct {
+	DB *sql.DB
+}
+
+func nowRFC3339() string {
+	return time.Now().Format(time.RFC3339)
+}
 
 func CreateTables() {
 	db, err := sql.Open("sqlite", "./database.db")
@@ -14,104 +25,372 @@ func CreateTables() {
 	}
 	defer db.Close()
 
-	sqlStmt := `CREATE TABLE IF NOT EXISTS players (
-		id INTEGER PRIMARY KEY, 
-		discord_id INTEGER UNIQUE,
-		tokens INTEGER DEFAULT 100,
-		created_at TEXT DEFAULT (datetime('now')),
-		updated_at TEXT DEFAULT (datetime('now'))
-	);
-	CREATE TABLE IF NOT EXISTS gamemode (
-		id INTEGER PRIMARY KEY,
-		name TEXT NOT NULL
-	);
-	CREATE TABLE IF NOT EXISTS player_ratings (
-		player_id INTEGER, 
-		GameModeID INTEGER, 
-		elo INT DEFAULT 1000,   
-		matches INTEGER DEFAULT 0, 
-		wins INTEGER DEFAULT 0,
-		created_at TEXT DEFAULT (datetime('now')),
-		updated_at TEXT DEFAULT (datetime('now')),
-		PRIMARY KEY (player_id, GameModeID),
-		FOREIGN KEY (player_id) REFERENCES players(id) ON DELETE CASCADE,
-		FOREIGN KEY (GameModeID) REFERENCES gamemode(id)
-	);
-	CREATE TABLE IF NOT EXISTS queue (
-		discord_id INTEGER UNIQUE, 
-		GameModeID INTEGER,
-		is_matched BOOLEAN DEFAULT FALSE,
-		is_unqueued BOOLEAN DEFAULT FALSE,
-		timestamp_queued TEXT,
-		timestamp_matched TEXT,
-		timestamp_unqueued TEXT,
-		created_at TEXT DEFAULT (datetime('now')),
-		updated_at TEXT DEFAULT (datetime('now')),
-		FOREIGN KEY (GameModeID) REFERENCES gamemode(id)
-	);
-	CREATE TABLE IF NOT EXISTS matches (
-		id INTEGER PRIMARY KEY AUTOINCREMENT, 
-		player1 INTEGER, 
-		player2 INTEGER, 
-		GameModeID INTEGER, 
-		thread_id INTEGER,  
-		created_at TEXT DEFAULT (datetime('now')),
-		updated_at TEXT DEFAULT (datetime('now')),
-		FOREIGN KEY (GameModeID) REFERENCES gamemode(id)
-	);
-	CREATE TABLE IF NOT EXISTS match_history (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		player1 INTEGER,
-		player2 INTEGER,
-		winner INTEGER,
-		GameModeID INTEGER,
-		elo_before_winner INTEGER,
-		elo_after_winner INTEGER,
-		elo_before_loser INTEGER,
-		elo_after_loser INTEGER,
-		datetime TEXT,
-		FOREIGN KEY (GameModeID) REFERENCES gamemode(id)
-	);
-	INSERT OR IGNORE INTO gamemode (id, name) VALUES (1, 'land');
-	INSERT OR IGNORE INTO gamemode (id, name) VALUES (2, 'conquest');
-	INSERT OR IGNORE INTO gamemode (id, name) VALUES (3, 'domination');
-	INSERT OR IGNORE INTO gamemode (id, name) VALUES (4, 'luckytest');
-	CREATE TABLE IF NOT EXISTS bets (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		match_id INTEGER,
-		bettor_id INTEGER,
-		bet_side INTEGER, 
-		amount INTEGER,
-		placed_at TEXT,
-		resolved BOOLEAN DEFAULT FALSE,
-		FOREIGN KEY (match_id) REFERENCES matches(id),
-		FOREIGN KEY (bettor_id) REFERENCES players(id)
-	);
-	CREATE TABLE IF NOT EXISTS user_rewards (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		user_id INTEGER,
-		reward_name TEXT,
-		role_id INTEGER,
-		awarded_at TEXT,
-		expires_at TEXT NULL,
-		FOREIGN KEY (user_id) REFERENCES players(id) ON DELETE CASCADE
-	);
-	CREATE TABLE IF NOT EXISTS logs (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		timestamp TEXT DEFAULT (datetime('now')),
-		command TEXT NOT NULL,
-		user_id INTEGER NOT NULL,
-		user_name TEXT NOT NULL
-	);
-	INSERT INTO user_rewards (user_id, reward_name, role_id, awarded_at, expires_at)
-	VALUES
-		(1, 'Champion', 123456789, datetime('now'), NULL),
-		(2, 'Elite Gambler', 987654321, datetime('now'), datetime('now', '+30 days')),
-		(3, 'High Roller', 567891234, datetime('now'), datetime('now', '+60 days'));`
-
-	_, err = db.Exec(sqlStmt)
+	schemaSQL, err := os.ReadFile("./internal/schema.sql")
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Failed to read schema file: %v", err)
 	}
-	log.Println("Tables created successfully")
+
+	_, err = db.Exec(string(schemaSQL))
+	if err != nil {
+		log.Fatalf("Failed to execute schema SQL: %v", err)
+	}
+
+	log.Println("Database schema created and initialized.")
+}
+
+func (m *MatchDB) LogEvent(command string, userID int64, userName string) {
+	_, err := m.DB.Exec(`
+		INSERT INTO logs (timestamp, command, user_id, user_name) 
+		VALUES (?, ?, ?, ?)`,
+		nowRFC3339(), command, userID, userName,
+	)
+	if err != nil {
+		log.Printf("log_event error: %v", err)
+	}
+}
+
+func (m *MatchDB) GetPlayerID(discordID int64) (int64, error) {
+	var id int64
+	err := m.DB.QueryRow("SELECT id FROM players WHERE discord_id = ?", discordID).Scan(&id)
+	if err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+func (m *MatchDB) FetchPlayerRating(discordID int64, gameModeID int) (int, error) {
+	var elo int
+	query := `
+		SELECT elo FROM player_ratings 
+		WHERE player_id = (SELECT id FROM players WHERE discord_id = ?) 
+		  AND GameModeID = ?
+	`
+	err := m.DB.QueryRow(query, discordID, gameModeID).Scan(&elo)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return 1000, nil
+		}
+		return 0, err
+	}
+	return elo, nil
+}
+
+func AddPlayer(db *sql.DB, userID int64) {
+	now := nowRFC3339()
+	stmt := `
+		INSERT INTO players (discord_id, created_at, updated_at)
+		    VALUES (?, ?, ?)
+		    ON CONFLICT(discord_id) DO UPDATE SET updated_at = ?
+		    `
+	_, err := db.Exec(stmt, userID, now, now, now)
+	if err != nil {
+		log.Printf("Error adding player: %v", err)
+	}
+}
+
+func AddPlayerMode(db *sql.DB, discordID int64, gameModeID int) {
+	var playerID int64
+
+	err := db.QueryRow("SELECT id FROM players WHERE discord_id = ?", discordID).Scan(&playerID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			log.Printf("Player with Discord ID %d not found", discordID)
+			return
+		}
+		log.Printf("Error fetching player: %v", err)
+		return
+	}
+
+	stmt := `
+		INSERT OR IGNORE INTO player_ratings (player_id, GameModeID, elo, matches, wins)
+		VALUES (?, ?, 1000, 0, 0)
+	`
+	_, err = db.Exec(stmt, playerID, gameModeID)
+	if err != nil {
+		log.Printf("Error inserting player rating: %v", err)
+		return
+	}
+}
+
+func UpdateElo(db *sql.DB, discordID int64, gameModeID int, newElo int) {
+	stmt := `
+		UPDATE player_ratings 
+		SET elo = ?
+		WHERE player_id = (SELECT id FROM players WHERE discord_id = ?) AND GameModeID = ?
+	`
+
+	_, err := db.Exec(stmt, newElo, discordID, gameModeID)
+	if err != nil {
+		log.Printf("Error updating elo: %v", err)
+	}
+}
+
+func GetQueuePlayers(db *sql.DB, gameModeID int) []int64 {
+	stmt := `
+		SELECT discord_id FROM queue 
+		WHERE GameModeID = ? AND is_matched = FALSE AND is_unqueued = FALSE
+	`
+
+	rows, err := db.Query(stmt, gameModeID)
+	if err != nil {
+		log.Printf("Error fetching queue players: %v", err)
+		return nil
+	}
+	defer rows.Close()
+
+	var players []int64
+	for rows.Next() {
+		var discordID int64
+		if err := rows.Scan(&discordID); err != nil {
+			log.Printf("Error scanning discord_id: %v", err)
+			continue
+		}
+		players = append(players, discordID)
+	}
+
+	return players
+}
+
+func GetQueuePlayersCount(db *sql.DB, gameModeID int) int {
+	stmt := `
+		SELECT COUNT(*) FROM queue 
+		WHERE GameModeID = ? AND is_matched = FALSE AND is_unqueued = FALSE
+	`
+
+	var count int
+	err := db.QueryRow(stmt, gameModeID).Scan(&count)
+	if err != nil {
+		log.Printf("Error counting queue players: %v", err)
+		return 0
+	}
+
+	return count
+}
+
+func (m *MatchDB) AddToQueue(discordID int64, gameModeID int) {
+	now := nowRFC3339()
+
+	const stmt = `
+		INSERT INTO queue (discord_id, GameModeID, timestamp_queued, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(discord_id) DO UPDATE SET
+			GameModeID = excluded.GameModeID,
+			is_matched = FALSE,
+			is_unqueued = FALSE,
+			timestamp_queued = excluded.timestamp_queued,
+			timestamp_matched = NULL,
+			timestamp_unqueued = NULL,
+			updated_at = excluded.updated_at
+	`
+
+	_, err := m.DB.Exec(stmt, discordID, gameModeID, now, now, now)
+	if err != nil {
+		log.Printf("[AddToQueue] Exec error: %v", err)
+		return
+	}
+
+	m.LogEvent("add_to_queue", discordID, fmt.Sprintf("User %d added to queue for mode %d", discordID, gameModeID))
+}
+
+func (m *MatchDB) MarkAsMatched(discordID int64) {
+	now := nowRFC3339()
+
+	const stmt = `
+		UPDATE queue
+		SET is_matched = TRUE,
+			timestamp_matched = ?,
+			updated_at = ?
+		WHERE discord_id = ?
+	`
+
+	_, err := m.DB.Exec(stmt, now, now, discordID)
+	if err != nil {
+		log.Printf("[MarkAsMatched] Exec error: %v", err)
+		return
+	}
+
+	m.LogEvent("mark_as_matched", discordID, fmt.Sprintf("User %d marked as matched", discordID))
+}
+
+func (m *MatchDB) MarkAsUnqueued(discordID int64) {
+	now := nowRFC3339()
+
+	const stmt = `
+		UPDATE queue
+		SET is_unqueued = TRUE,
+			timestamp_unqueued = ?,
+			updated_at = ?
+		WHERE discord_id = ?
+	`
+
+	_, err := m.DB.Exec(stmt, now, now, discordID)
+	if err != nil {
+		log.Printf("[MarkAsUnqueued] Exec error: %v", err)
+		return
+	}
+
+	m.LogEvent("mark_as_unqueued", discordID, fmt.Sprintf("User %d marked as unqueued", discordID))
+}
+
+func (m *MatchDB) CreateMatch(player1DiscordID, player2DiscordID int64, gameModeID int, threadID int64) error {
+	now := nowRFC3339()
+
+	player1ID, err := m.GetPlayerID(player1DiscordID)
+	if err != nil {
+		return err
+	}
+	player2ID, err := m.GetPlayerID(player2DiscordID)
+	if err != nil {
+		return err
+	}
+
+	_, err = m.DB.Exec(`
+		INSERT INTO matches (player1, player2, GameModeID, thread_id, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		player1ID, player2ID, gameModeID, threadID, now, now,
+	)
+	if err != nil {
+		return err
+	}
+
+	m.LogEvent("create_match", player1DiscordID, "UnknownUser")
+	return nil
+}
+
+func (m *MatchDB) RemoveMatch(player1ID, player2ID int64) {
+	const stmt = `
+		DELETE FROM matches 
+		WHERE (player1 = ? AND player2 = ?) 
+		   OR (player1 = ? AND player2 = ?)
+	`
+
+	res, err := m.DB.Exec(stmt, player1ID, player2ID, player2ID, player1ID)
+	if err != nil {
+		log.Printf("[RemoveMatch] Exec error: %v", err)
+		return
+	}
+
+	affected, _ := res.RowsAffected()
+	if affected == 0 {
+		log.Printf("[RemoveMatch] No match found for players %d and %d", player1ID, player2ID)
+		return
+	}
+
+	m.LogEvent("remove_match", player1ID, fmt.Sprintf("Removed match between players %d and %d", player1ID, player2ID))
+}
+
+func (m *MatchDB) RecordMatchResult(winnerDiscordID, loserDiscordID int64, gameModeID int,
+	eloBeforeWinner, eloAfterWinner, eloBeforeLoser, eloAfterLoser int) error {
+
+	now := nowRFC3339()
+
+	winnerID, err := m.GetPlayerID(winnerDiscordID)
+	if err != nil {
+		return err
+	}
+	loserID, err := m.GetPlayerID(loserDiscordID)
+	if err != nil {
+		return err
+	}
+
+	_, err = m.DB.Exec(`
+		INSERT INTO match_history (player1, player2, winner, GameModeID,
+								   elo_before_winner, elo_after_winner,
+								   elo_before_loser, elo_after_loser, datetime)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		winnerID, loserID, winnerID, gameModeID,
+		eloBeforeWinner, eloAfterWinner,
+		eloBeforeLoser, eloAfterLoser,
+		now,
+	)
+	if err != nil {
+		return err
+	}
+
+	_, err = m.DB.Exec(`
+		UPDATE player_ratings
+		SET elo = ?, matches = matches + 1, wins = wins + 1
+		WHERE player_id = ? AND GameModeID = ?`,
+		eloAfterWinner, winnerID, gameModeID,
+	)
+	if err != nil {
+		return err
+	}
+
+	_, err = m.DB.Exec(`
+		UPDATE player_ratings
+		SET elo = ?, matches = matches + 1
+		WHERE player_id = ? AND GameModeID = ?`,
+		eloAfterLoser, loserID, gameModeID,
+	)
+	return err
+}
+
+func GetQueueStatus(db *sql.DB, discordID int64) *int {
+	var gameModeID int
+	err := db.QueryRow(`
+		SELECT GameModeID FROM queue
+		WHERE discord_id = ? AND is_matched = FALSE AND is_unqueued = FALSE
+	`, discordID).Scan(&gameModeID)
+
+	if err == sql.ErrNoRows {
+		return nil
+	} else if err != nil {
+		log.Printf("GetQueueStatus error: %v", err)
+		return nil
+	}
+	return &gameModeID
+}
+
+func GetMatchDetails(db *sql.DB, discordID int64) (opponentID *int64, gameModeID *int) {
+	var player1, player2 int64
+	var gmID int
+	err := db.QueryRow(`
+		SELECT player1, player2, GameModeID FROM matches
+		WHERE player1 = ? OR player2 = ?
+	`, discordID, discordID).Scan(&player1, &player2, &gmID)
+
+	if err == sql.ErrNoRows {
+		return nil, nil
+	} else if err != nil {
+		log.Printf("GetMatchDetails error: %v", err)
+		return nil, nil
+	}
+
+	var opponent int64
+	if player1 == discordID {
+		opponent = player2
+	} else {
+		opponent = player1
+	}
+
+	return &opponent, &gmID
+}
+
+func GetPlayerRating(db *sql.DB, discordID int64, gameModeID int) string {
+	var elo int
+	err := db.QueryRow(`
+		SELECT elo FROM player_ratings
+		WHERE player_id = (SELECT id FROM players WHERE discord_id = ?) AND GameModeID = ?
+	`, discordID, gameModeID).Scan(&elo)
+
+	if err == sql.ErrNoRows {
+		return "N/A"
+	} else if err != nil {
+		log.Printf("GetPlayerRating error: %v", err)
+		return "N/A"
+	}
+	return fmt.Sprintf("%d", elo)
+}
+
+func UpdatePlayerRating(db *sql.DB, playerID int64, gameModeID, rating int) {
+	_, err := db.Exec(`
+		UPDATE player_ratings
+		SET elo = ?, matches = matches + 1
+		WHERE player_id = ? AND GameModeID = ?
+	`, rating, playerID, gameModeID)
+
+	if err != nil {
+		log.Printf("UpdatePlayerRating error: %v", err)
+	}
 }
