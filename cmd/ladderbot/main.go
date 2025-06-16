@@ -12,6 +12,8 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	db := internal.InitDB()
+	defer db.Close()
 	internal.CreateTables()
 	internal.BotToken = string(BotToken)
 	internal.Run()

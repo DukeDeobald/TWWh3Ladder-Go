@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -12,6 +13,30 @@ import (
 
 type MatchDB struct {
 	DB *sql.DB
+}
+
+func InitDB() *sql.DB {
+	db, err := sql.Open("sqlite", "./database.db")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	schemaSQL, err := os.ReadFile("./internal/schema.sql")
+	if err != nil {
+		log.Fatalf("Failed to read schema file: %v", err)
+	}
+
+	_, err = db.Exec(string(schemaSQL))
+	if err != nil {
+		log.Fatalf("Failed to execute schema SQL: %v", err)
+	}
+
+	log.Println("Database schema created and initialized.")
+	return db
+}
+
+func NewMatchDB(db *sql.DB) *MatchDB {
+	return &MatchDB{DB: db}
 }
 
 func nowRFC3339() string {
@@ -75,23 +100,23 @@ func (m *MatchDB) FetchPlayerRating(discordID int64, gameModeID int) (int, error
 	return elo, nil
 }
 
-func AddPlayer(db *sql.DB, userID int64) {
+func (m *MatchDB) AddPlayer(userID int64) {
 	now := nowRFC3339()
 	stmt := `
 		INSERT INTO players (discord_id, created_at, updated_at)
 		    VALUES (?, ?, ?)
 		    ON CONFLICT(discord_id) DO UPDATE SET updated_at = ?
-		    `
-	_, err := db.Exec(stmt, userID, now, now, now)
+	`
+	_, err := m.DB.Exec(stmt, userID, now, now, now)
 	if err != nil {
 		log.Printf("Error adding player: %v", err)
 	}
 }
 
-func AddPlayerMode(db *sql.DB, discordID int64, gameModeID int) {
+func (m *MatchDB) AddPlayerMode(discordID int64, gameModeID int) {
 	var playerID int64
 
-	err := db.QueryRow("SELECT id FROM players WHERE discord_id = ?", discordID).Scan(&playerID)
+	err := m.DB.QueryRow("SELECT id FROM players WHERE discord_id = ?", discordID).Scan(&playerID)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			log.Printf("Player with Discord ID %d not found", discordID)
@@ -105,33 +130,33 @@ func AddPlayerMode(db *sql.DB, discordID int64, gameModeID int) {
 		INSERT OR IGNORE INTO player_ratings (player_id, GameModeID, elo, matches, wins)
 		VALUES (?, ?, 1000, 0, 0)
 	`
-	_, err = db.Exec(stmt, playerID, gameModeID)
+	_, err = m.DB.Exec(stmt, playerID, gameModeID)
 	if err != nil {
 		log.Printf("Error inserting player rating: %v", err)
 		return
 	}
 }
 
-func UpdateElo(db *sql.DB, discordID int64, gameModeID int, newElo int) {
+func (m *MatchDB) UpdateElo(discordID int64, gameModeID int, newElo int) {
 	stmt := `
 		UPDATE player_ratings 
 		SET elo = ?
 		WHERE player_id = (SELECT id FROM players WHERE discord_id = ?) AND GameModeID = ?
 	`
 
-	_, err := db.Exec(stmt, newElo, discordID, gameModeID)
+	_, err := m.DB.Exec(stmt, newElo, discordID, gameModeID)
 	if err != nil {
 		log.Printf("Error updating elo: %v", err)
 	}
 }
 
-func GetQueuePlayers(db *sql.DB, gameModeID int) []int64 {
+func (m *MatchDB) GetQueuePlayers(gameModeID int) []int64 {
 	stmt := `
 		SELECT discord_id FROM queue 
 		WHERE GameModeID = ? AND is_matched = FALSE AND is_unqueued = FALSE
 	`
 
-	rows, err := db.Query(stmt, gameModeID)
+	rows, err := m.DB.Query(stmt, gameModeID)
 	if err != nil {
 		log.Printf("Error fetching queue players: %v", err)
 		return nil
@@ -151,14 +176,14 @@ func GetQueuePlayers(db *sql.DB, gameModeID int) []int64 {
 	return players
 }
 
-func GetQueuePlayersCount(db *sql.DB, gameModeID int) int {
+func (m *MatchDB) GetQueuePlayersCount(gameModeID int) int {
 	stmt := `
 		SELECT COUNT(*) FROM queue 
 		WHERE GameModeID = ? AND is_matched = FALSE AND is_unqueued = FALSE
 	`
 
 	var count int
-	err := db.QueryRow(stmt, gameModeID).Scan(&count)
+	err := m.DB.QueryRow(stmt, gameModeID).Scan(&count)
 	if err != nil {
 		log.Printf("Error counting queue players: %v", err)
 		return 0
@@ -326,9 +351,9 @@ func (m *MatchDB) RecordMatchResult(winnerDiscordID, loserDiscordID int64, gameM
 	return err
 }
 
-func GetQueueStatus(db *sql.DB, discordID int64) *int {
+func (m *MatchDB) GetQueueStatus(discordID int64) *int {
 	var gameModeID int
-	err := db.QueryRow(`
+	err := m.DB.QueryRow(`
 		SELECT GameModeID FROM queue
 		WHERE discord_id = ? AND is_matched = FALSE AND is_unqueued = FALSE
 	`, discordID).Scan(&gameModeID)
@@ -342,10 +367,10 @@ func GetQueueStatus(db *sql.DB, discordID int64) *int {
 	return &gameModeID
 }
 
-func GetMatchDetails(db *sql.DB, discordID int64) (opponentID *int64, gameModeID *int) {
+func (m *MatchDB) GetMatchDetails(discordID int64) (opponentID *int64, gameModeID *int) {
 	var player1, player2 int64
 	var gmID int
-	err := db.QueryRow(`
+	err := m.DB.QueryRow(`
 		SELECT player1, player2, GameModeID FROM matches
 		WHERE player1 = ? OR player2 = ?
 	`, discordID, discordID).Scan(&player1, &player2, &gmID)
@@ -367,9 +392,9 @@ func GetMatchDetails(db *sql.DB, discordID int64) (opponentID *int64, gameModeID
 	return &opponent, &gmID
 }
 
-func GetPlayerRating(db *sql.DB, discordID int64, gameModeID int) string {
+func (m *MatchDB) GetPlayerRating(discordID int64, gameModeID int) string {
 	var elo int
-	err := db.QueryRow(`
+	err := m.DB.QueryRow(`
 		SELECT elo FROM player_ratings
 		WHERE player_id = (SELECT id FROM players WHERE discord_id = ?) AND GameModeID = ?
 	`, discordID, gameModeID).Scan(&elo)
@@ -383,8 +408,8 @@ func GetPlayerRating(db *sql.DB, discordID int64, gameModeID int) string {
 	return fmt.Sprintf("%d", elo)
 }
 
-func UpdatePlayerRating(db *sql.DB, playerID int64, gameModeID, rating int) {
-	_, err := db.Exec(`
+func (m *MatchDB) UpdatePlayerRating(playerID int64, gameModeID, rating int) {
+	_, err := m.DB.Exec(`
 		UPDATE player_ratings
 		SET elo = ?, matches = matches + 1
 		WHERE player_id = ? AND GameModeID = ?
@@ -393,4 +418,23 @@ func UpdatePlayerRating(db *sql.DB, playerID int64, gameModeID, rating int) {
 	if err != nil {
 		log.Printf("UpdatePlayerRating error: %v", err)
 	}
+}
+
+func (m *MatchDB) GetMatchThread(player1ID, player2ID int64, gameModeID int) string {
+	var threadID int64
+	err := m.DB.QueryRow(`
+        SELECT thread_id FROM matches
+        WHERE ((player1 = ? AND player2 = ?) OR (player1 = ? AND player2 = ?))
+          AND GameModeID = ?`,
+		player1ID, player2ID, player2ID, player1ID, gameModeID,
+	).Scan(&threadID)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return ""
+		}
+		log.Printf("GetMatchThread error: %v", err)
+		return ""
+	}
+	return strconv.FormatInt(threadID, 10)
 }

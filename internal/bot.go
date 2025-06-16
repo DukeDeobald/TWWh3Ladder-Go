@@ -5,11 +5,31 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
 )
+
+var MODE_MAP = map[string]int{
+	"land":       1,
+	"l":          1,
+	"conquest":   2,
+	"c":          2,
+	"domination": 3,
+	"d":          3,
+	"luckytest":  4,
+	"lt":         4,
+}
+
+var REVERSE_MODE_MAP = map[int]string{1: "land",
+	2: "conquest",
+	3: "domination",
+	4: "luckytest",
+}
+
+var mdb *MatchDB
 
 var startTime time.Time
 
@@ -29,11 +49,15 @@ func formatDuration(d time.Duration) string {
 }
 
 func Run() {
+	db := InitDB()
+	mdb = NewMatchDB(db)
 
 	discord, err := discordgo.New("Bot " + BotToken)
 	checkNilErr(err)
 
-	discord.AddHandler(newMessage)
+	discord.AddHandler(func(s *discordgo.Session, m *discordgo.MessageCreate) {
+		newMessage(s, m, mdb)
+	})
 
 	discord.Open()
 	defer discord.Close()
@@ -49,7 +73,7 @@ func Run() {
 
 }
 
-func newMessage(discord *discordgo.Session, message *discordgo.MessageCreate) {
+func newMessage(discord *discordgo.Session, message *discordgo.MessageCreate, mdb *MatchDB) {
 	if message.Author.ID == discord.State.User.ID {
 		return
 	}
@@ -74,5 +98,46 @@ func newMessage(discord *discordgo.Session, message *discordgo.MessageCreate) {
 			formatDuration(uptime),
 		)
 		discord.ChannelMessageSend(message.ChannelID, msg)
+	case strings.Contains(message.Content, "!s"):
+		playerID, err := strconv.ParseInt(message.Author.ID, 10, 64)
+		if err != nil {
+			discord.ChannelMessageSend(message.ChannelID, "Invalid user ID.")
+			return
+		}
+
+		queueStatus := mdb.GetQueueStatus(playerID)
+		if queueStatus != nil {
+			modeName, ok := REVERSE_MODE_MAP[*queueStatus]
+			if !ok {
+				modeName = "Unknown Mode"
+			}
+			msg := fmt.Sprintf("You are in the queue for %s mode.", modeName)
+			discord.ChannelMessageSend(message.ChannelID, msg)
+			return
+		}
+
+		opponent, gameModeID := mdb.GetMatchDetails(playerID)
+		if opponent != nil && gameModeID != nil {
+			modeName, ok := REVERSE_MODE_MAP[*gameModeID]
+			if !ok {
+				modeName = "Unknown Mode"
+			}
+			threadID := mdb.GetMatchThread(playerID, *opponent, *gameModeID)
+			if threadID != "" {
+				threadChannel, err := discord.Channel(threadID)
+				if err == nil && threadChannel != nil {
+					msg := fmt.Sprintf("%s, you are in a match (%s) against <@%d> in %s.",
+						message.Author.Username, modeName, *opponent)
+					discord.ChannelMessageSend(message.ChannelID, msg)
+					return
+				}
+			}
+			msg := fmt.Sprintf("%s, you are in a match (%s) against <@%d>.", message.Author.Username, modeName, *opponent)
+			discord.ChannelMessageSend(message.ChannelID, msg)
+			return
+		}
+
+		discord.ChannelMessageSend(message.ChannelID, fmt.Sprintf("%s, you are not in queue or in a match.", message.Author.Username))
+
 	}
 }
